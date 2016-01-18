@@ -9,6 +9,8 @@
 
 package org.eclipse.cdt.example.framespy;
 
+import java.util.concurrent.RejectedExecutionException;
+
 import org.eclipse.cdt.dsf.concurrent.DataRequestMonitor;
 import org.eclipse.cdt.dsf.concurrent.DsfRunnable;
 import org.eclipse.cdt.dsf.datamodel.IDMContext;
@@ -25,7 +27,11 @@ import org.eclipse.core.runtime.IAdaptable;
 import org.eclipse.core.runtime.preferences.IEclipsePreferences;
 import org.eclipse.core.runtime.preferences.InstanceScope;
 import org.eclipse.debug.ui.DebugUITools;
+import org.eclipse.debug.ui.contexts.DebugContextEvent;
+import org.eclipse.debug.ui.contexts.IDebugContextListener;
 import org.eclipse.jface.action.MenuManager;
+import org.eclipse.jface.viewers.ISelection;
+import org.eclipse.jface.viewers.IStructuredSelection;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.custom.StyledText;
 import org.eclipse.swt.layout.GridData;
@@ -35,7 +41,7 @@ import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Menu;
 import org.eclipse.ui.part.ViewPart;
 
-public class FrameSpyView extends ViewPart {
+public class FrameSpyView extends ViewPart implements IDebugContextListener {
 
 	private static final int MAX_LOG_SIZE = 20*1024*1024;
 	private static final String TOGGLE_STATE_PREF_KEY = "toggle.state";
@@ -77,6 +83,7 @@ public class FrameSpyView extends ViewPart {
 	public void dispose() {
 		super.dispose();
 		fMenuManager.dispose();
+		cancelPollingJob();
 	}
 
 	public boolean getToggledState() {
@@ -107,6 +114,9 @@ public class FrameSpyView extends ViewPart {
 	}
 
 	private void startPollingJob() {
+		// Register to be told whenever the Debug view selection changes
+        DebugUITools.getDebugContextManager().addDebugContextListener(this);
+
 		// Get the debug selection to know what the user is looking at in the Debug view
 		IAdaptable context = DebugUITools.getDebugContext();
 		if (context == null) {
@@ -136,35 +146,53 @@ public class FrameSpyView extends ViewPart {
 	}
 
 	/**
+	 * This method un-registers listeners.
+	 */
+	private void cancelPollingJob() {
+        DebugUITools.getDebugContextManager().removeDebugContextListener(this);
+
+        unRegisterForEvents(fSession);
+	}
+	
+	/**
 	 * This method registers with the specified session to receive
 	 * DSF events.
 	 * @param session The session for which we want to receive events
 	 */
 	private void registerForEvents(DsfSession session) {
-		if (session != null) {
+		if (session != null && !session.equals(fSession)) {
+			// First un-register from the previous session
+			if (fSession != null) {
+				unRegisterForEvents(fSession);
+			}
+
+			// Now register for the new session
+			// Don't use fSession here as it may change before our
+			// asynchronous execution has started
 			fSession = session;
-			fSession.getExecutor().submit(new DsfRunnable() {
+			session.getExecutor().submit(new DsfRunnable() {
 				@Override
 				public void run() {
-					fSession.addServiceEventListener(FrameSpyView.this, null);
+					session.addServiceEventListener(FrameSpyView.this, null);
 				}
 			});
 		}
 	}
 	
-	/**
-	 * This method un-registers from the specified session to stop
-	 * getting DSF events.
-	 * @param session The session from which we want to no longer receive events
-	 */
-	private void cancelPollingJob() {
-		if (fSession != null) {
-			fSession.getExecutor().submit(new DsfRunnable() {
+	private void unRegisterForEvents(DsfSession session) {
+		// Don't use fSession here as it may change before our
+		// asynchronous execution has started
+		if (session != null) {
+			try {
+			session.getExecutor().submit(new DsfRunnable() {
 				@Override
 				public void run() {
-					fSession.removeServiceEventListener(FrameSpyView.this);
+					session.removeServiceEventListener(FrameSpyView.this);
 				}
-			});			
+			});
+			} catch (RejectedExecutionException e) {
+				// Session already gone
+			}
 		}
 	}
 	
@@ -249,5 +277,31 @@ public class FrameSpyView extends ViewPart {
 		}
 		
 		logFrameInfo(session, dmcontext);
+	}
+
+	@Override
+	public void debugContextChanged(DebugContextEvent event) {
+		ISelection selection = event.getContext();
+		if (selection instanceof IStructuredSelection) {
+            IStructuredSelection ss = (IStructuredSelection)selection;
+            if (!ss.isEmpty()) {
+            	// Log for the first element only, even if we select multiple debug sessions
+                Object element = ss.getFirstElement();
+                if (element instanceof IAdaptable) {
+            		IDMContext dmcontext = ((IAdaptable)element).getAdapter(IDMContext.class);
+            		if (dmcontext != null) {
+            			// Extract DSF session id from the DM context
+            			String sessionId = dmcontext.getSessionId();
+            			// Get the full DSF session to have access to the DSF executor
+            			DsfSession session = DsfSession.getSession(sessionId);
+            			if (session == null) {
+            				// It could be that this session is no longer active
+            				return;
+            			}
+            			registerForEvents(session);
+            		}
+                }
+            }
+        }
 	}
 }
